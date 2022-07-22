@@ -26,12 +26,18 @@ import io.netty.channel.ChannelPromise;
 import io.netty.channel.DefaultChannelPromise;
 import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http2.Http2Connection;
+import io.netty.handler.codec.http2.Http2FrameCodec;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.GenericFutureListener;
 import org.apache.commons.lang3.StringUtils;
+import org.assertj.core.api.Assertions;
+import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -40,9 +46,12 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Mockito;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Signal;
+import reactor.core.publisher.Sinks;
+import reactor.core.scheduler.Schedulers;
 import reactor.netty.BaseHttpTest;
 import reactor.netty.ByteBufMono;
 import reactor.netty.ConnectionObserver;
@@ -51,11 +60,13 @@ import reactor.netty.http.Http2SslContextSpec;
 import reactor.netty.http.HttpProtocol;
 import reactor.netty.http.client.Http2AllocationStrategy;
 import reactor.netty.http.client.HttpClient;
+import reactor.netty.http.client.HttpClientResponse;
 import reactor.netty.http.server.HttpServer;
 import reactor.netty.internal.shaded.reactor.pool.InstrumentedPool;
 import reactor.netty.internal.shaded.reactor.pool.PoolShutdownException;
 import reactor.test.StepVerifier;
 import reactor.util.annotation.Nullable;
+import reactor.util.retry.Retry;
 
 import javax.net.ssl.SSLException;
 import java.io.IOException;
@@ -66,7 +77,10 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
@@ -624,6 +638,107 @@ class DefaultPooledConnectionProviderTest extends BaseHttpTest {
 		}
 	}
 
+	@Test
+	void testRetryAfterH2GoAwayFrame() {
+		Http2SslContextSpec serverCtx = Http2SslContextSpec.forServer(ssc.certificate(), ssc.privateKey());
+		Http2SslContextSpec clientCtx =
+				Http2SslContextSpec.forClient()
+						.configure(builder -> builder.trustManager(InsecureTrustManagerFactory.INSTANCE));
+
+		final Sinks.One<Boolean> hasHeldChannel = Sinks.one();
+		final Sinks.One<Boolean> allowChannelShutdown = Sinks.one();
+		AtomicBoolean firstCall = new AtomicBoolean(true);
+		disposableServer =
+				createServer()
+						.wiretap(false)
+						.protocol(HttpProtocol.H2)
+						.secure(spec -> spec.sslContext(serverCtx))
+						.handle((req, res) -> {
+							if (req.uri().endsWith("/held_stream")) {
+								hasHeldChannel.tryEmitValue(true);
+								// Hold one stream open on this Connection, making use of graceful shutdown to prevent
+								// the underlying socket channel from being closed.
+								return res.sendString(allowChannelShutdown.asMono().then(Mono.just("DONE")));
+							}
+							if (firstCall.compareAndSet(true, false)) {
+								// Start closing the socket channel to cause the server to issue a GOAWAY frame.
+								return res.withConnection(conn -> {
+									final Channel streamChannel = conn.channel();
+									final Channel socketChannel = streamChannel.parent();
+
+									// Set unlimited timeout for graceful shutdown to make the socket channel
+									// only closed when allowChannelShutdown is triggered.
+									socketChannel.pipeline()
+											.get(Http2FrameCodec.class)
+											.gracefulShutdownTimeoutMillis(-1);
+
+									final DefaultChannelPromise promise = new DefaultChannelPromise(socketChannel);
+									socketChannel.close(promise);
+								});
+							} else {
+								return res.sendString(Flux.just("OK"));
+							}
+						})
+						.bindNow();
+
+		DefaultPooledConnectionProvider provider =
+				(DefaultPooledConnectionProvider) ConnectionProvider.builder("testGoAway")
+						.allocationStrategy(Http2AllocationStrategy.builder().maxConnections(1).build())
+						.build();
+
+		// Capture when the GoAway frame has been received.
+		final Sinks.One<Boolean> goAwayReceived = Sinks.one();
+		final Http2Connection.Listener goAwayFrameListener = Mockito.mock(Http2Connection.Listener.class);
+		Mockito.doAnswer(invocation -> {
+					goAwayReceived.tryEmitValue(true);
+					return null;
+				})
+				.when(goAwayFrameListener)
+				.onGoAwayReceived(Mockito.anyInt(), Mockito.anyLong(), Mockito.any());
+
+		final HttpClient client = createClient(provider, disposableServer::address)
+				.protocol(HttpProtocol.H2)
+				.secure(spec -> spec.sslContext(clientCtx))
+				.doOnConnected(conn -> {
+					final Http2Connection http2Conn = conn.channel()
+							.pipeline()
+							.get(Http2FrameCodec.class)
+							.connection();
+
+					http2Conn.addListener(goAwayFrameListener);
+				});
+
+		// Use an outer StepVerifier to hold the Connection's socket channel open.
+		StepVerifier.create(
+				client.get()
+						.uri("/held_stream")
+						.responseContent()
+						.asString()
+		)
+				.expectSubscription()
+				// In an inner StepVerifier, run a request that encounters a GoAway frame at first, but can be retried.
+				.then(() -> StepVerifier.create(hasHeldChannel.asMono().thenMany(
+						client.get()
+								.uri("/")
+								.response()
+								.map(HttpClientResponse::status)
+								.subscribeOn(Schedulers.parallel())
+								// The connection should be released from the pool shortly after receiving a GoAway frame,
+								// so retries should acquire a new connection.
+								.retryWhen(Retry.from(retries ->
+										// Allow a decent number of retries, but only starting after GoAway has been received.
+										retries.zipWith(goAwayReceived.asMono().repeat(10))))
+								.repeat(1)
+						))
+						.expectNext(HttpResponseStatus.OK)
+						.expectNext(HttpResponseStatus.OK)
+						.verifyComplete())
+				.then(() -> allowChannelShutdown.tryEmitValue(true))
+				.expectNext("DONE")
+				.expectComplete()
+				.verify(Duration.ofSeconds(30));
+	}
+
 	static final class TestPromise extends DefaultChannelPromise {
 
 		final ChannelPromise parent;
@@ -634,7 +749,6 @@ class DefaultPooledConnectionProviderTest extends BaseHttpTest {
 			this.parent = parent;
 			this.closeCount = closeCount;
 		}
-
 		@Override
 		@SuppressWarnings("FutureReturnValueIgnored")
 		public boolean trySuccess(Void result) {
